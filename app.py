@@ -11,16 +11,22 @@ from rag import Chunk, Euri, Pipeline, chunk_text
 load_dotenv()
 ROOT = Path(__file__).parent
 DEMO = "Can an Atlas employee who joined 20 days ago work remotely from Lisbon for 20 days, and who must approve it?"
-st.set_page_config(page_title="Retrace | Iterative RAG", page_icon="🔎", layout="wide")
-st.title("Retrace · Iterative retrieval RAG")
-st.caption("Retrieve → check evidence → rewrite → retrieve again → grounded answer")
+st.set_page_config(page_title="Retrace | Retrieval RAG", page_icon="🔎", layout="wide")
+st.title("Retrace · Iterative and recursive retrieval RAG")
+st.caption("Iterative query refinement or recursive subquestion retrieval → grounded answer")
 with st.sidebar:
     st.header("Live Euri connection")
     key = st.text_input("Euri API key", value=os.getenv("EURI_API_KEY", ""), type="password")
     st.caption("Questions and documents are sent to Euri. Keys stay in this server session.")
-    retries = st.slider("Maximum retries", 0, 5, 3)
+    mode = st.segmented_control("Retrieval approach", ["Iterative", "Recursive"], default="Iterative")
+    if mode == "Recursive":
+        max_depth = st.slider("Maximum recursion depth", 0, 4, 2)
+        max_searches = st.slider("Maximum total searches", 1, 20, 6)
+        st.caption("The root is depth 0. Subquestions share evidence and the total search budget.")
+    else:
+        retries = st.slider("Maximum retries", 0, 5, 3)
+        st.caption("Total searches ≤ 1 + maximum retries. Use zero retries for one-shot retrieval.")
     top_k = st.slider("Passages per attempt", 1, 10, 1)
-    st.caption("Total searches ≤ 1 + maximum retries. Use zero retries for one-shot retrieval.")
     uploads = st.file_uploader("Add UTF-8 text / Markdown", type=["txt", "md"], accept_multiple_files=True)
     include_sample = st.checkbox("Include fictional Atlas handbook", value=True)
     st.caption("A relevance judgment is a model estimate, not a guarantee of correctness.")
@@ -45,8 +51,13 @@ if st.button("Run live retrieval", type="primary"):
         with st.status("Embedding knowledge base and checking evidence…", expanded=True) as status:
             provider = Euri(key)
             pipeline = Pipeline(provider, chunks)
-            result = pipeline.run(question, retries, top_k,
-                on_attempt=lambda a: st.write(f"Attempt {a['attempt']}: {a['query']} — {a['assessment']['reason']}"))
+            def show_attempt(a):
+                st.write(f"Attempt {a['attempt']}: {a['query']} — {a['assessment']['reason']}")
+            if mode == "Recursive":
+                result = pipeline.run_recursive(question, max_depth, max_searches, top_k,
+                                                on_attempt=show_attempt)
+            else:
+                result = pipeline.run(question, retries, top_k, on_attempt=show_attempt)
             result["models"] = {"embedding": provider.embedding_model, "generation": provider.chat_model}
             st.session_state.result = result
             status.update(label="Retrieval complete", state="complete")
@@ -59,13 +70,36 @@ if "result" in st.session_state:
     st.subheader("Final answer")
     st.markdown(r["answer"])
     if not r["sufficient"]:
-        st.warning("Evidence remains incomplete. Read the missing-evidence notes below.")
-    st.caption(f"Stop: {r['stop_reason']} · {len(r['attempts'])} searches")
+        assessment = r.get("final_assessment", r["attempts"][-1]["assessment"])
+        st.warning("The retrieved passages do not yet support a complete answer.")
+        st.write("**Missing evidence:**", assessment.get("missing") or
+                 "The evidence judge did not specify the missing facts.")
+        st.write("**Evidence check:**", assessment["reason"])
+        stop_notes = {
+            "retry_limit": "The iterative retry budget was exhausted. Increase Maximum retries or Passages per attempt, then run again.",
+            "search_limit": "The recursive search budget was exhausted. Increase Maximum total searches or Passages per attempt, then run again.",
+            "depth_limit": "A recursive branch reached the depth limit. Increase Maximum recursion depth or Passages per attempt, then run again.",
+            "repeated_query": "The model repeated an earlier search. Try a more specific original question or increase Passages per attempt.",
+            "decomposition_exhausted": "The subquestion tree finished without enough evidence. Try a more specific question or increase Passages per attempt.",
+        }
+        st.info(stop_notes.get(r["stop_reason"], "Inspect the final evidence check and retrieved passages below."))
+        st.caption("If the missing facts are absent from the knowledge base, upload a document containing them. More searches cannot supply facts absent from the documents.")
+    st.caption(f"Mode: {r.get('mode', 'iterative')} · Stop: {r['stop_reason']} · {len(r['attempts'])} searches")
     st.write("**Original query:**", r["original_query"])
+    if r.get("mode") == "recursive":
+        with st.expander("Recursive subquestion tree", expanded=True):
+            for node in r["nodes"]:
+                st.text(f"{'  ' * node['depth']}Node {node['id']} (parent {node['parent_id']}, "
+                        f"depth {node['depth']}): {node['query']} [{node['status']}]")
     for attempt in r["attempts"]:
-        with st.expander(f"Attempt {attempt['attempt']} · {'Initial query' if attempt['attempt']==1 else 'Rewritten query'}", expanded=True):
+        label = (f"Subquestion at depth {attempt['depth']}" if 'depth' in attempt
+                 else 'Initial query' if attempt['attempt'] == 1 else 'Rewritten query')
+        with st.expander(f"Attempt {attempt['attempt']} · {label}", expanded=True):
             st.write(attempt["query"])
             st.json(attempt["assessment"])
+            if "local_assessment" in attempt:
+                st.write("Subquestion evidence check:")
+                st.json(attempt["local_assessment"])
             for hit in attempt["results"]:
                 st.markdown(f"**#{hit['rank']} · [{hit['chunk']['id']}] {hit['chunk']['source']}** · cosine {hit['score']:.4f}")
                 st.write(hit["chunk"]["text"])
